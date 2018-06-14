@@ -18,74 +18,102 @@ import (
 
 // EntryQueryBuilder builds a SQL query to fetch entries.
 type EntryQueryBuilder struct {
-	store              *Storage
-	feedID             int64
-	userID             int64
-	categoryID         int64
-	status             string
-	notStatus          string
-	order              string
-	direction          string
-	limit              int
-	offset             int
-	entryID            int64
-	greaterThanEntryID int64
-	entryIDs           []int64
-	before             *time.Time
-	starred            bool
+	store      *Storage
+	args       []interface{}
+	conditions []string
+	order      string
+	direction  string
+	limit      int
+	offset     int
 }
 
 // WithStarred adds starred filter.
 func (e *EntryQueryBuilder) WithStarred() *EntryQueryBuilder {
-	e.starred = true
+	e.conditions = append(e.conditions, "e.starred is true")
 	return e
 }
 
-// Before add condition base on the entry date.
-func (e *EntryQueryBuilder) Before(date *time.Time) *EntryQueryBuilder {
-	e.before = date
+// BeforeDate adds a condition < published_at
+func (e *EntryQueryBuilder) BeforeDate(date time.Time) *EntryQueryBuilder {
+	e.conditions = append(e.conditions, fmt.Sprintf("e.published_at < $%d", len(e.args)+1))
+	e.args = append(e.args, date)
 	return e
 }
 
-// WithGreaterThanEntryID adds a condition > entryID.
-func (e *EntryQueryBuilder) WithGreaterThanEntryID(entryID int64) *EntryQueryBuilder {
-	e.greaterThanEntryID = entryID
+// AfterDate adds a condition > published_at
+func (e *EntryQueryBuilder) AfterDate(date time.Time) *EntryQueryBuilder {
+	e.conditions = append(e.conditions, fmt.Sprintf("e.published_at > $%d", len(e.args)+1))
+	e.args = append(e.args, date)
+	return e
+}
+
+// BeforeEntryID adds a condition < entryID.
+func (e *EntryQueryBuilder) BeforeEntryID(entryID int64) *EntryQueryBuilder {
+	if entryID != 0 {
+		e.conditions = append(e.conditions, fmt.Sprintf("e.id < $%d", len(e.args)+1))
+		e.args = append(e.args, entryID)
+	}
+	return e
+}
+
+// AfterEntryID adds a condition > entryID.
+func (e *EntryQueryBuilder) AfterEntryID(entryID int64) *EntryQueryBuilder {
+	if entryID != 0 {
+		e.conditions = append(e.conditions, fmt.Sprintf("e.id > $%d", len(e.args)+1))
+		e.args = append(e.args, entryID)
+	}
 	return e
 }
 
 // WithEntryIDs adds a condition to fetch only the given entry IDs.
 func (e *EntryQueryBuilder) WithEntryIDs(entryIDs []int64) *EntryQueryBuilder {
-	e.entryIDs = entryIDs
+	e.conditions = append(e.conditions, fmt.Sprintf("e.id = ANY($%d)", len(e.args)+1))
+	e.args = append(e.args, pq.Array(entryIDs))
 	return e
 }
 
 // WithEntryID set the entryID.
 func (e *EntryQueryBuilder) WithEntryID(entryID int64) *EntryQueryBuilder {
-	e.entryID = entryID
+	if entryID != 0 {
+		e.conditions = append(e.conditions, fmt.Sprintf("e.id = $%d", len(e.args)+1))
+		e.args = append(e.args, entryID)
+	}
 	return e
 }
 
 // WithFeedID set the feedID.
 func (e *EntryQueryBuilder) WithFeedID(feedID int64) *EntryQueryBuilder {
-	e.feedID = feedID
+	if feedID != 0 {
+		e.conditions = append(e.conditions, fmt.Sprintf("e.feed_id = $%d", len(e.args)+1))
+		e.args = append(e.args, feedID)
+	}
 	return e
 }
 
 // WithCategoryID set the categoryID.
 func (e *EntryQueryBuilder) WithCategoryID(categoryID int64) *EntryQueryBuilder {
-	e.categoryID = categoryID
+	if categoryID != 0 {
+		e.conditions = append(e.conditions, fmt.Sprintf("f.category_id = $%d", len(e.args)+1))
+		e.args = append(e.args, categoryID)
+	}
 	return e
 }
 
 // WithStatus set the entry status.
 func (e *EntryQueryBuilder) WithStatus(status string) *EntryQueryBuilder {
-	e.status = status
+	if status != "" {
+		e.conditions = append(e.conditions, fmt.Sprintf("e.status = $%d", len(e.args)+1))
+		e.args = append(e.args, status)
+	}
 	return e
 }
 
 // WithoutStatus set the entry status that should not be returned.
 func (e *EntryQueryBuilder) WithoutStatus(status string) *EntryQueryBuilder {
-	e.notStatus = status
+	if status != "" {
+		e.conditions = append(e.conditions, fmt.Sprintf("e.status <> $%d", len(e.args)+1))
+		e.args = append(e.args, status)
+	}
 	return e
 }
 
@@ -115,14 +143,12 @@ func (e *EntryQueryBuilder) WithOffset(offset int) *EntryQueryBuilder {
 
 // CountEntries count the number of entries that match the condition.
 func (e *EntryQueryBuilder) CountEntries() (count int, err error) {
-	defer timer.ExecutionTime(
-		time.Now(),
-		fmt.Sprintf("[EntryQueryBuilder:CountEntries] userID=%d, feedID=%d, status=%s", e.userID, e.feedID, e.status),
-	)
-
 	query := `SELECT count(*) FROM entries e LEFT JOIN feeds f ON f.id=e.feed_id WHERE %s`
-	args, condition := e.buildCondition()
-	err = e.store.db.QueryRow(fmt.Sprintf(query, condition), args...).Scan(&count)
+	condition := e.buildCondition()
+
+	defer timer.ExecutionTime(time.Now(), fmt.Sprintf("[EntryQueryBuilder:CountEntries] condition=%s, args=%v", condition, e.args))
+
+	err = e.store.db.QueryRow(fmt.Sprintf(query, condition), e.args...).Scan(&count)
 	if err != nil {
 		return 0, fmt.Errorf("unable to count entries: %v", err)
 	}
@@ -152,9 +178,6 @@ func (e *EntryQueryBuilder) GetEntry() (*model.Entry, error) {
 
 // GetEntries returns a list of entries that match the condition.
 func (e *EntryQueryBuilder) GetEntries() (model.Entries, error) {
-	debugStr := "[EntryQueryBuilder:GetEntries] userID=%d, feedID=%d, categoryID=%d, status=%s, order=%s, direction=%s, offset=%d, limit=%d"
-	defer timer.ExecutionTime(time.Now(), fmt.Sprintf(debugStr, e.userID, e.feedID, e.categoryID, e.status, e.order, e.direction, e.offset, e.limit))
-
 	query := `
 		SELECT
 		e.id, e.user_id, e.feed_id, e.hash, e.published_at at time zone u.timezone, e.title,
@@ -171,11 +194,13 @@ func (e *EntryQueryBuilder) GetEntries() (model.Entries, error) {
 		WHERE %s %s
 	`
 
-	args, conditions := e.buildCondition()
-	query = fmt.Sprintf(query, conditions, e.buildSorting())
-	// log.Println(query)
+	condition := e.buildCondition()
+	sorting := e.buildSorting()
+	query = fmt.Sprintf(query, condition, sorting)
 
-	rows, err := e.store.db.Query(query, args...)
+	defer timer.ExecutionTime(time.Now(), fmt.Sprintf("[EntryQueryBuilder:GetEntries] %s, args=%v, sorting=%s", condition, e.args, sorting))
+
+	rows, err := e.store.db.Query(query, e.args...)
 	if err != nil {
 		return nil, fmt.Errorf("unable to get entries: %v", err)
 	}
@@ -187,8 +212,8 @@ func (e *EntryQueryBuilder) GetEntries() (model.Entries, error) {
 		var iconID interface{}
 		var tz string
 
-		entry.Feed = &model.Feed{UserID: e.userID}
-		entry.Feed.Category = &model.Category{UserID: e.userID}
+		entry.Feed = &model.Feed{}
+		entry.Feed.Category = &model.Category{}
 		entry.Feed.Icon = &model.FeedIcon{}
 
 		err := rows.Scan(
@@ -232,7 +257,9 @@ func (e *EntryQueryBuilder) GetEntries() (model.Entries, error) {
 		entry.Feed.CheckedAt = timezone.Convert(tz, entry.Feed.CheckedAt)
 
 		entry.Feed.ID = entry.FeedID
+		entry.Feed.UserID = entry.UserID
 		entry.Feed.Icon.FeedID = entry.FeedID
+		entry.Feed.Category.UserID = entry.UserID
 		entries = append(entries, &entry)
 	}
 
@@ -241,22 +268,15 @@ func (e *EntryQueryBuilder) GetEntries() (model.Entries, error) {
 
 // GetEntryIDs returns a list of entry IDs that match the condition.
 func (e *EntryQueryBuilder) GetEntryIDs() ([]int64, error) {
-	debugStr := "[EntryQueryBuilder:GetEntryIDs] userID=%d, feedID=%d, categoryID=%d, status=%s, order=%s, direction=%s, offset=%d, limit=%d"
-	defer timer.ExecutionTime(time.Now(), fmt.Sprintf(debugStr, e.userID, e.feedID, e.categoryID, e.status, e.order, e.direction, e.offset, e.limit))
+	query := `SELECT e.id FROM entries e LEFT JOIN feeds f ON f.id=e.feed_id WHERE %s %s`
 
-	query := `
-		SELECT
-		e.id
-		FROM entries e
-		LEFT JOIN feeds f ON f.id=e.feed_id
-		WHERE %s %s
-	`
-
-	args, conditions := e.buildCondition()
-	query = fmt.Sprintf(query, conditions, e.buildSorting())
+	condition := e.buildCondition()
+	query = fmt.Sprintf(query, condition, e.buildSorting())
 	// log.Println(query)
 
-	rows, err := e.store.db.Query(query, args...)
+	defer timer.ExecutionTime(time.Now(), fmt.Sprintf("[EntryQueryBuilder:GetEntryIDs] condition=%s, args=%v", condition, e.args))
+
+	rows, err := e.store.db.Query(query, e.args...)
 	if err != nil {
 		return nil, fmt.Errorf("unable to get entries: %v", err)
 	}
@@ -277,84 +297,37 @@ func (e *EntryQueryBuilder) GetEntryIDs() ([]int64, error) {
 	return entryIDs, nil
 }
 
-func (e *EntryQueryBuilder) buildCondition() ([]interface{}, string) {
-	args := []interface{}{e.userID}
-	conditions := []string{"e.user_id = $1"}
-
-	if e.categoryID != 0 {
-		conditions = append(conditions, fmt.Sprintf("f.category_id=$%d", len(args)+1))
-		args = append(args, e.categoryID)
-	}
-
-	if e.feedID != 0 {
-		conditions = append(conditions, fmt.Sprintf("e.feed_id=$%d", len(args)+1))
-		args = append(args, e.feedID)
-	}
-
-	if e.entryID != 0 {
-		conditions = append(conditions, fmt.Sprintf("e.id=$%d", len(args)+1))
-		args = append(args, e.entryID)
-	}
-
-	if e.greaterThanEntryID != 0 {
-		conditions = append(conditions, fmt.Sprintf("e.id > $%d", len(args)+1))
-		args = append(args, e.greaterThanEntryID)
-	}
-
-	if e.entryIDs != nil {
-		conditions = append(conditions, fmt.Sprintf("e.id=ANY($%d)", len(args)+1))
-		args = append(args, pq.Array(e.entryIDs))
-	}
-
-	if e.status != "" {
-		conditions = append(conditions, fmt.Sprintf("e.status=$%d", len(args)+1))
-		args = append(args, e.status)
-	}
-
-	if e.notStatus != "" {
-		conditions = append(conditions, fmt.Sprintf("e.status != $%d", len(args)+1))
-		args = append(args, e.notStatus)
-	}
-
-	if e.before != nil {
-		conditions = append(conditions, fmt.Sprintf("e.published_at < $%d", len(args)+1))
-		args = append(args, e.before)
-	}
-
-	if e.starred {
-		conditions = append(conditions, "e.starred is true")
-	}
-
-	return args, strings.Join(conditions, " AND ")
+func (e *EntryQueryBuilder) buildCondition() string {
+	return strings.Join(e.conditions, " AND ")
 }
 
 func (e *EntryQueryBuilder) buildSorting() string {
-	var queries []string
+	var parts []string
 
 	if e.order != "" {
-		queries = append(queries, fmt.Sprintf(`ORDER BY "%s"`, e.order))
+		parts = append(parts, fmt.Sprintf(`ORDER BY "%s"`, e.order))
 	}
 
 	if e.direction != "" {
-		queries = append(queries, fmt.Sprintf(`%s`, e.direction))
+		parts = append(parts, fmt.Sprintf(`%s`, e.direction))
 	}
 
 	if e.limit != 0 {
-		queries = append(queries, fmt.Sprintf(`LIMIT %d`, e.limit))
+		parts = append(parts, fmt.Sprintf(`LIMIT %d`, e.limit))
 	}
 
 	if e.offset != 0 {
-		queries = append(queries, fmt.Sprintf(`OFFSET %d`, e.offset))
+		parts = append(parts, fmt.Sprintf(`OFFSET %d`, e.offset))
 	}
 
-	return strings.Join(queries, " ")
+	return strings.Join(parts, " ")
 }
 
 // NewEntryQueryBuilder returns a new EntryQueryBuilder.
 func NewEntryQueryBuilder(store *Storage, userID int64) *EntryQueryBuilder {
 	return &EntryQueryBuilder{
-		store:   store,
-		userID:  userID,
-		starred: false,
+		store:      store,
+		args:       []interface{}{userID},
+		conditions: []string{"e.user_id = $1"},
 	}
 }
